@@ -812,7 +812,6 @@ struct AnalysisSameEventPairing {
     runMCGen(groupedMCTracks);
   }
 
-
   void processJpsiToMuMuSkimmed(soa::Filtered<MyEventsSelected>::iterator const& event,
                                 soa::Filtered<MyMuonTracksSelected> const& muons,
                                 ReducedMCEvents const& eventsMC, ReducedMCTracks const& tracksMC)
