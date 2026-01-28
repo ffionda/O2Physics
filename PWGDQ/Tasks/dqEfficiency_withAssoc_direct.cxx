@@ -23,6 +23,9 @@
 #include "PWGDQ/Core/MixingLibrary.h"
 #include "PWGDQ/Core/VarManager.h"
 #include "PWGDQ/DataModel/ReducedInfoTables.h"
+#include <DetectorsVertexing/PVertexer.h>
+#include <ReconstructionDataFormats/Track.h>
+#include <Common/Core/trackUtilities.h>
 
 #include "Common/Core/PID/PIDTOFParamService.h"
 #include "Common/Core/TableHelper.h"
@@ -1120,6 +1123,8 @@ struct AnalysisSameEventPairing {
     Configurable<float> magField{"cfgMagField", 5.0f, "Manually set magnetic field"};
     Configurable<bool> flatTables{"cfgFlatTables", false, "Produce a single flat tables with all relevant information of the pairs and single tracks"};
     Configurable<bool> useKFVertexing{"cfgUseKFVertexing", false, "Use KF Particle for secondary vertex reconstruction (DCAFitter is used by default)"};
+    Configurable<bool> recomputePV{"cfgRecomputePV", false, "Recompute primary vertex to calculate unbiased pseudoproperDL"};
+    Configurable<bool> removeDiamondConstrPV{"cfgRemoveDiamondPV", false, "remove diamond constrain for PV recomputation"};
     Configurable<bool> useAbsDCA{"cfgUseAbsDCA", false, "Use absolute DCA minimization instead of chi^2 minimization in secondary vertexing"};
     Configurable<bool> propToPCA{"cfgPropToPCA", false, "Propagate tracks to secondary vertex"};
     Configurable<bool> corrFullGeo{"cfgCorrFullGeo", false, "Use full geometry to correct for MCS effects in track propagation"};
@@ -1151,6 +1156,12 @@ struct AnalysisSameEventPairing {
   Service<o2::ccdb::BasicCCDBManager> fCCDB;
 
   HistogramManager* fHistMan;
+
+  // vectors needed for PV recomputation
+  std::vector<int64_t> pvContribGlobIDs;
+  std::vector<o2::track::TrackParCov> pvContribTrackPars;
+  std::vector<bool> vec_useTrk_PVrefit;
+
 
   // keep histogram class names in maps, so we don't have to buld their names in the pair loops
   std::map<int, std::vector<TString>> fTrackHistNames;
@@ -1497,14 +1508,18 @@ struct AnalysisSameEventPairing {
     cout << "AnalysisSameEventPairing::init() completed" << endl;
   }
 
+
   void initParamsFromCCDB(uint64_t timestamp, bool withTwoProngFitter = true)
   {
     cout << "AnalysisSameEventPairing::initParamsFromCCDB() called for timestamp " << timestamp << endl;
     if (fConfigOptions.useRemoteField.value) {
       o2::parameters::GRPMagField* grpmag = fCCDB->getForTimeStamp<o2::parameters::GRPMagField>(fConfigCCDB.grpMagPath, timestamp);
+      o2::base::MatLayerCylSet* lut = o2::base::MatLayerCylSet::rectifyPtrFromFile(fCCDB->get<o2::base::MatLayerCylSet>(fConfigCCDB.lutPath)); 
       float magField = 0.0;
       if (grpmag != nullptr) {
         magField = grpmag->getNominalL3Field();
+	o2::base::Propagator::initFieldFromGRP(grpmag);
+        o2::base::Propagator::Instance()->setMatLUT(lut);
       } else {
         LOGF(fatal, "GRP object is not available in CCDB at timestamp=%llu", timestamp);
       }
@@ -1533,9 +1548,65 @@ struct AnalysisSameEventPairing {
     cout << "AnalysisSameEventPairing::initParamsFromCCDB() completed" << endl;
   }
 
+template <typename Events, typename TTracks, typename Tracks>
+bool refitPVWithPVertexer(Events const& collision,  TTracks const& tracks, Tracks const& t1, Tracks const& t2, o2::dataformats::VertexBase& pvRefitted)
+{
+ // --- build PV contributor list ---
+  pvContribGlobIDs.clear();
+  pvContribTrackPars.clear();
+  // int nMyPVContrib = 0;
+  for (auto const& trk : tracks) { 
+    // check if it is PV contributor
+    if (!trk.isPVContributor()) continue;
+    // check if it contributes to the vtx of this collision 
+    if (trk.collisionId() != collision.globalIndex()) continue;
+    pvContribGlobIDs.push_back(trk.globalIndex());
+    pvContribTrackPars.push_back(getTrackParCov(trk));
+    // nMyPVContrib++;
+  }
+
+  // printf("contributors from collision %d - from refitting %d \n",collision.numContrib(),nMyPVContrib);
+  vec_useTrk_PVrefit.assign(pvContribGlobIDs.size(), true);
+  // --- build VertexBase from event collision ---
+  o2::dataformats::VertexBase Pvtx;
+  Pvtx.setX(collision.posX());
+  Pvtx.setY(collision.posY());
+  Pvtx.setZ(collision.posZ());
+  Pvtx.setCov(collision.covXX(), collision.covXY(), collision.covYY(),
+              collision.covXZ(), collision.covYZ(), collision.covZZ());
+
+  // --- configure vertexer ---
+  o2::vertexing::PVertexer vertexer;
+  if (fConfigOptions.removeDiamondConstrPV) {
+  o2::conf::ConfigurableParam::updateFromString("pvertexer.useMeanVertexConstraint=false");
+  }
+  vertexer.init();
+
+  bool PVrefit_doable = vertexer.prepareVertexRefit(pvContribTrackPars, Pvtx);
+  if (!PVrefit_doable) return false;
+
+  // --- remove t1 and t2 if they are PV contributors ---
+  auto removeTrackFromRefit = [&](Tracks const& t) {
+    auto it = std::find(pvContribGlobIDs.begin(), pvContribGlobIDs.end(), t.globalIndex());
+    if (it != pvContribGlobIDs.end()) {
+      int entry = std::distance(pvContribGlobIDs.begin(), it);
+      vec_useTrk_PVrefit[entry] = false;
+    }
+  };
+
+  removeTrackFromRefit(t1);
+  removeTrackFromRefit(t2);
+
+  // --- do the refit ---
+  pvRefitted = vertexer.refitVertex(vec_useTrk_PVrefit, Pvtx);
+
+  return true;
+}
+
+
   // Template function to run same event pairing (barrel-barrel, muon-muon, barrel-muon)
   template <bool TTwoProngFitter, int TPairType, uint32_t TEventFillMap, uint32_t TTrackFillMap, typename TEvents, typename TTracks>
-  void runSameEventPairing(TEvents const& events, BCsWithTimestamps const& bcs, Preslice<soa::Join<aod::TrackAssoc, aod::BarrelTrackCuts, aod::Prefilter>>& preslice, soa::Join<aod::TrackAssoc, aod::BarrelTrackCuts, aod::Prefilter> const& assocs, TTracks const& /*tracks*/, McCollisions const& /*mcEvents*/, McParticles const& /*mcTracks*/)
+  void runSameEventPairing(TEvents const& events, BCsWithTimestamps const& bcs, Preslice<soa::Join<aod::TrackAssoc, aod::BarrelTrackCuts, aod::Prefilter>>& preslice, soa::Join<aod::TrackAssoc, aod::BarrelTrackCuts, aod::Prefilter> const& assocs, TTracks const& tracks, McCollisions const& /*mcEvents*/, McParticles const& /*mcTracks*/)
   {
     cout << "AnalysisSameEventPairing::runSameEventPairing() called" << endl;
     if (events.size() == 0) {
@@ -1646,7 +1717,14 @@ struct AnalysisSameEventPairing {
           }
           if constexpr (TTwoProngFitter) {
             VarManager::FillPairVertexing<TPairType, TEventFillMap, TTrackFillMap>(event, t1, t2, fConfigOptions.propToPCA);
-          }
+	    if(fConfigOptions.recomputePV){
+	    // printf("vtx before: %f %f %f \n", event.posX(), event.posY(), event.posZ());
+	    o2::dataformats::VertexBase pvRefit;
+	    bool ok = refitPVWithPVertexer(event, tracks, t1, t2, pvRefit);
+	    // printf("vtx after: ok %d - %f %f %f \n",ok,pvRefit.getX(), pvRefit.getY(), pvRefit.getZ());
+            VarManager::FillPairVertexingRecomputePV<TPairType, TEventFillMap, TTrackFillMap>(event, t1, t2, pvRefit, fConfigOptions.propToPCA);
+            }
+	  }
           if constexpr (eventHasQvector) {
             VarManager::FillPairVn<TPairType>(t1, t2);
           }

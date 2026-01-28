@@ -1307,6 +1307,8 @@ class VarManager : public TObject
   static void FillQuadMC(T1 const& t1, T2 const& t2, T2 const& t3, float* values = nullptr);
   template <int pairType, uint32_t collFillMap, uint32_t fillMap, typename C, typename T>
   static void FillPairVertexing(C const& collision, T const& t1, T const& t2, bool propToSV = false, float* values = nullptr);
+  template <int pairType, uint32_t collFillMap, uint32_t fillMap, typename C, typename T>
+  static void FillPairVertexingRecomputePV(C const& collision, T const& t1, T const& t2, o2::dataformats::VertexBase pvRefitted, bool propToSV = false, float* values = nullptr);
   template <uint32_t collFillMap, uint32_t fillMap, typename C, typename T>
   static void FillTripletVertexing(C const& collision, T const& t1, T const& t2, T const& t3, PairCandidateType tripletType, float* values = nullptr);
   template <int candidateType, uint32_t collFillMap, uint32_t fillMap, typename C, typename T1>
@@ -4181,6 +4183,7 @@ void VarManager::FillPairVertexing(C const& collision, T const& t1, T const& t2,
 
       if constexpr ((pairType == kDecayToEE || pairType == kDecayToKPi) && trackHasCov) {
         secondaryVertex = fgFitterTwoProngBarrel.getPCACandidate();
+	// printf("secVtx (first) %f %f  %f \n",secondaryVertex[0],secondaryVertex[1],secondaryVertex[2]);
         covMatrixPCA = fgFitterTwoProngBarrel.calcPCACovMatrixFlat();
         auto chi2PCA = fgFitterTwoProngBarrel.getChi2AtPCACandidate();
         auto trackParVar0 = fgFitterTwoProngBarrel.getTrack(0);
@@ -4464,6 +4467,111 @@ void VarManager::FillPairVertexing(C const& collision, T const& t1, T const& t2,
     values[kEta2] = t2.eta();
     values[kPhi2] = t2.phi();
   }
+}
+
+template <int pairType, uint32_t collFillMap, uint32_t fillMap, typename C, typename T>
+void VarManager::FillPairVertexingRecomputePV(C const& collision, T const& t1, T const& t2, o2::dataformats::VertexBase pvRefitted, bool propToSV, float* values )
+{
+    
+   // check at compile time that the event and cov matrix have the cov matrix
+   constexpr bool eventHasVtxCov = ((collFillMap & Collision) > 0 || (collFillMap & ReducedEventVtxCov) > 0);
+   constexpr bool trackHasCov = ((fillMap & TrackCov) > 0 || (fillMap & ReducedTrackBarrelCov) > 0);
+   constexpr bool muonHasCov = ((fillMap & MuonCov) > 0 || (fillMap & ReducedMuonCov) > 0);
+
+   if (!values) {
+    values = fgValues;
+   }
+ 
+   float m1 = o2::constants::physics::MassElectron;
+   float m2 = o2::constants::physics::MassElectron;
+   if constexpr (pairType == kDecayToKPi) {
+    m1 = o2::constants::physics::MassKaonCharged;
+    m2 = o2::constants::physics::MassPionCharged;
+   }
+   if constexpr (pairType == kDecayToMuMu && muonHasCov) {
+    m1 = o2::constants::physics::MassMuon;
+    m2 = o2::constants::physics::MassMuon;
+   }
+   ROOT::Math::PtEtaPhiMVector v1(t1.pt(), t1.eta(), t1.phi(), m1);
+   ROOT::Math::PtEtaPhiMVector v2(t2.pt(), t2.eta(), t2.phi(), m2);
+   ROOT::Math::PtEtaPhiMVector v12 = v1 + v2;
+
+    if(fgFitterTwoProngBarrel.getNCandidates() == 0) return;
+    Vec3D secondaryVertex;
+
+    if constexpr (eventHasVtxCov) {
+
+      std::array<float, 6> covMatrixPCA{};
+      // get track impact parameters
+      o2::math_utils::Point3D<float> vtxXYZ(pvRefitted.getX(), pvRefitted.getY(), pvRefitted.getZ());
+      auto covMatrixPV = pvRefitted.getCov();
+
+      if constexpr ((pairType == kDecayToEE || pairType == kDecayToKPi) && trackHasCov) {
+        // Get pca candidate from forward DCA fitter
+	// no need to re-compute secondary vertex (done already in FillPairVertexing)
+        secondaryVertex = fgFitterTwoProngBarrel.getPCACandidate();
+	// printf("secVtx %f %f  %f \n",secondaryVertex[0],secondaryVertex[1],secondaryVertex[2]);
+        covMatrixPCA = fgFitterTwoProngBarrel.calcPCACovMatrixFlat();
+	auto trackParVar0 = fgFitterTwoProngBarrel.getTrack(0);
+        auto trackParVar1 = fgFitterTwoProngBarrel.getTrack(1);
+        v1 = {trackParVar0.getPt(), trackParVar0.getEta(), trackParVar0.getPhi(), m1};
+        v2 = {trackParVar1.getPt(), trackParVar1.getEta(), trackParVar1.getPhi(), m2};
+        v12 = v1 + v2; 
+
+      } else if constexpr (pairType == kDecayToMuMu && muonHasCov) {
+        // Get pca candidate from forward DCA fitter
+	// no need to re-compute secondary vertex (done already in FillPairVertexing)
+        secondaryVertex = fgFitterTwoProngFwd.getPCACandidate();
+        covMatrixPCA = fgFitterTwoProngFwd.calcPCACovMatrixFlat();
+        auto trackParVar0 = fgFitterTwoProngFwd.getTrack(0);
+        auto trackParVar1 = fgFitterTwoProngFwd.getTrack(1);
+        v1 = {trackParVar0.getPt(), trackParVar0.getEta(), trackParVar0.getPhi(), m1};
+        v2 = {trackParVar1.getPt(), trackParVar1.getEta(), trackParVar1.getPhi(), m2};
+        v12 = v1 + v2;
+      }
+      double phi = std::atan2(secondaryVertex[1] - pvRefitted.getY(), secondaryVertex[0] - pvRefitted.getX());
+      double theta = std::atan2(secondaryVertex[2] - pvRefitted.getZ(),
+                                std::sqrt((secondaryVertex[0] - pvRefitted.getX()) * (secondaryVertex[0] - pvRefitted.getX()) +
+                                          (secondaryVertex[1] - pvRefitted.getY()) * (secondaryVertex[1] - pvRefitted.getY())));
+
+      values[kVertexingLxyzErr] = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, theta) + getRotatedCovMatrixXX(covMatrixPCA, phi, theta));
+      values[kVertexingLxyErr] = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, 0.) + getRotatedCovMatrixXX(covMatrixPCA, phi, 0.));
+      values[kVertexingLzErr] = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, 0, theta) + getRotatedCovMatrixXX(covMatrixPCA, 0, theta));
+
+      values[kVertexingLxy] = (pvRefitted.getX() - secondaryVertex[0]) * (pvRefitted.getX() - secondaryVertex[0]) +
+                              (pvRefitted.getY() - secondaryVertex[1]) * (pvRefitted.getY() - secondaryVertex[1]);
+      values[kVertexingLz] = (pvRefitted.getZ() - secondaryVertex[2]) * (pvRefitted.getZ() - secondaryVertex[2]);
+      values[kVertexingLxyz] = values[kVertexingLxy] + values[kVertexingLz];
+      values[kVertexingLxy] = std::sqrt(values[kVertexingLxy]);
+      values[kVertexingLz] = std::sqrt(values[kVertexingLz]);
+      values[kVertexingLxyz] = std::sqrt(values[kVertexingLxyz]);
+
+      values[kVertexingTauz] = (pvRefitted.getZ() - secondaryVertex[2]) * v12.M() / (TMath::Abs(v12.Pz()) * o2::constants::physics::LightSpeedCm2NS);
+      values[kVertexingTauxy] = values[kVertexingLxy] * v12.M() / (v12.Pt() * o2::constants::physics::LightSpeedCm2NS);
+
+      values[kVertexingPz] = TMath::Abs(v12.Pz());
+      values[kVertexingSV] = secondaryVertex[2];
+
+      values[kVertexingTauzErr] = values[kVertexingLzErr] * v12.M() / (TMath::Abs(v12.Pz()) * o2::constants::physics::LightSpeedCm2NS);
+      values[kVertexingTauxyErr] = values[kVertexingLxyErr] * v12.M() / (v12.Pt() * o2::constants::physics::LightSpeedCm2NS);
+
+      values[kCosPointingAngle] = ((pvRefitted.getX() - secondaryVertex[0]) * v12.Px() +
+                                   (pvRefitted.getY() - secondaryVertex[1]) * v12.Py() +
+                                   (pvRefitted.getZ() - secondaryVertex[2]) * v12.Pz()) /
+                                  (v12.P() * values[VarManager::kVertexingLxyz]);
+      // Decay length defined as in Run 2
+      values[kVertexingLzProjected] = ((secondaryVertex[2] - pvRefitted.getZ()) * v12.Pz()) / TMath::Sqrt(v12.Pz() * v12.Pz());
+      values[kVertexingLxyProjected] = ((secondaryVertex[0] - pvRefitted.getX()) * v12.Px()) + ((secondaryVertex[1] - pvRefitted.getY()) * v12.Py());
+      values[kVertexingLxyProjected] = values[kVertexingLxyProjected] / TMath::Sqrt((v12.Px() * v12.Px()) + (v12.Py() * v12.Py()));
+      values[kVertexingLxyzProjected] = ((secondaryVertex[0] - pvRefitted.getX()) * v12.Px()) + ((secondaryVertex[1] - pvRefitted.getY()) * v12.Py()) + ((secondaryVertex[2] - pvRefitted.getZ()) * v12.Pz());
+      values[kVertexingLxyzProjected] = values[kVertexingLxyzProjected] / TMath::Sqrt((v12.Px() * v12.Px()) + (v12.Py() * v12.Py()) + (v12.Pz() * v12.Pz()));
+      values[kVertexingTauxyProjected] = values[kVertexingLxyProjected] * v12.M() / (v12.Pt());
+      values[kVertexingTauxyProjectedPoleJPsiMass] = values[kVertexingLxyProjected] * o2::constants::physics::MassJPsi / (v12.Pt());
+      values[kVertexingTauxyProjectedNs] = values[kVertexingTauxyProjected] / o2::constants::physics::LightSpeedCm2NS;
+      values[kVertexingTauzProjected] = values[kVertexingLzProjected] * v12.M() / TMath::Abs(v12.Pz());
+      values[kVertexingTauxyzProjected] = values[kVertexingLxyzProjected] * v12.M() / (v12.P());
+    } 
+
 }
 
 template <uint32_t collFillMap, uint32_t fillMap, typename C, typename T>
